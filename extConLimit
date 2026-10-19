@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Stop on unhandled errors, unset variables, and pipeline failures.
+set -euo pipefail
+
+# Set the percentage at which conservation mode should be enabled again.
+LIMIT=75
+
+# Point to the battery's capacity file.
+BAT=/sys/class/power_supply/BAT1
+# Point to the AC adapter's online-status file.
+AC=/sys/class/power_supply/ACAD
+# Point to the Lenovo conservation-mode control.
+CONS=/sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/conservation_mode
+
+# Require root because changing conservation mode writes to sysfs.
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
+
+# Refuse to proceed if the battery capacity cannot be read.
+[[ -r "$BAT/capacity" ]] || { echo "cannot read battery capacity: $BAT/capacity" >&2; exit 1; }
+# Refuse to proceed if the AC status cannot be read.
+[[ -r "$AC/online" ]] || { echo "cannot read AC status: $AC/online" >&2; exit 1; }
+# Refuse to proceed if conservation mode cannot be changed.
+[[ -w "$CONS" ]] || { echo "cannot write conservation mode: $CONS" >&2; exit 1; }
+
+# Open a lock file so only one instance can control charging at a time.
+exec 9>/run/lock/bat-limit.lock
+# Exit if another instance already holds the lock.
+flock -n 9 || { echo "already running" >&2; exit 1; }
+
+# Read the battery's current percentage from sysfs.
+cap() { cat "$BAT/capacity"; }
+# Return success only when the AC adapter reports that it is connected.
+ac_online() { [[ -r "$AC/online" ]] && [[ $(<"$AC/online") == 1 ]]; }
+# Write a binary value to the conservation-mode control.
+set_cons() { printf '%s\n' "$1" > "$CONS"; }
+
+# Mark whether cleanup should attempt to re-enable conservation mode.
+restore_cons=0
+# Store the UPower monitor's process ID for cleanup.
+UPID=
+
+# Restore conservation mode and stop the monitor whenever the script exits.
+cleanup() {
+    # Preserve the exit status that caused cleanup to run.
+    local status=$?
+    # Prevent cleanup from recursively running or handling another signal mid-cleanup.
+    trap - EXIT INT TERM HUP
+
+    # Restore conservation mode if this run may have disabled it.
+    if (( restore_cons )); then
+        # Report successful restoration.
+        if set_cons 1; then
+            echo "conservation mode restored" >&2
+        else
+            # Report restoration failure and ensure the script exits unsuccessfully.
+            echo "error: could not restore conservation mode" >&2
+            status=1
+        fi
+    fi
+
+    # Stop the UPower monitor if it was started.
+    if [[ -n ${UPID:-} ]]; then
+        kill "$UPID" 2>/dev/null || true
+    fi
+
+    # Exit with the original status unless restoration failed.
+    exit "$status"
+}
+
+# Run cleanup on any normal exit.
+trap cleanup EXIT
+# Make Ctrl-C exit through cleanup.
+trap 'exit 130' INT
+# Make SIGTERM exit through cleanup.
+trap 'exit 143' TERM
+# Make SIGHUP exit through cleanup.
+trap 'exit 129' HUP
+
+# Leave conservation mode unchanged if the laptop is not connected to AC power.
+ac_online || { echo "not on AC, nothing to do"; exit 0; }
+
+# Read the initial battery percentage or stop if the read fails.
+percentage=$(cap) || { echo "failed to read battery capacity" >&2; exit 1; }
+# Reject unexpected capacity contents before using arithmetic evaluation.
+[[ $percentage =~ ^[0-9]+$ ]] || { echo "invalid battery capacity: $percentage" >&2; exit 1; }
+
+# If the battery already meets the target, enable conservation mode and finish.
+if (( percentage >= LIMIT )); then
+    # Report an error if conservation mode cannot be enabled.
+    set_cons 1 || { echo "failed to enable conservation mode" >&2; exit 1; }
+	echo "limit is already reached"
+    # Exit; cleanup has nothing to restore because restore_cons is still zero.
+    exit 0
+fi
+
+# Start monitoring before changing the mode, and close the lock descriptor in the child.
+exec 3< <(upower --monitor 9>&-)
+# Remember the monitor process ID so cleanup can stop it.
+UPID=$!
+
+# Set this before writing, so cleanup tries restoration even if the write is interrupted.
+restore_cons=1
+# Disable conservation mode to allow charging above its normal limit.
+set_cons 0 || { echo "failed to disable conservation mode" >&2; exit 1; }
+
+# Keep checking state whenever UPower emits a notification.
+while :; do
+    # If AC power is disconnected, exit and let cleanup restore conservation mode.
+    ac_online || { echo "unplugged"; exit 0; }
+
+    # Refresh the battery percentage rather than trusting the monitor's message text.
+    percentage=$(cap) || { echo "failed to read battery capacity" >&2; exit 1; }
+    # Reject unexpected capacity contents before using arithmetic evaluation.
+    [[ $percentage =~ ^[0-9]+$ ]] || { echo "invalid battery capacity: $percentage" >&2; exit 1; }
+
+    # Once the target is reached, enable conservation mode and finish.
+    if (( percentage >= LIMIT )); then
+        # Enable conservation mode; cleanup will retry if this write fails.
+        if set_cons 1; then
+            # Mark restoration complete because conservation mode is now enabled.
+            restore_cons=0
+            # Report the percentage at which the mode was restored.
+            echo "reached ${percentage}%; conservation mode enabled"
+            # Exit normally now that the target has been reached.
+            exit 0
+        else
+            # Report the failure; cleanup will make another restoration attempt.
+            echo "failed to enable conservation mode at ${percentage}%" >&2
+            exit 1
+        fi
+    fi
+
+    # Wait for the next UPower notification; a closed monitor triggers cleanup.
+    IFS= read -r _ <&3 || { echo "upower monitor ended; exiting" >&2; exit 1; }
+done
